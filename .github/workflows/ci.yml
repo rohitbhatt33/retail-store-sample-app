@@ -1,63 +1,180 @@
-name: CI
+name: EKS health check
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "EKS cluster name (optional; falls back to secret EKS_CLUSTER_NAME)"
+        required: false
+      region:
+        description: "AWS region (optional; falls back to secret AWS_REGION)"
+        required: false
 
 jobs:
-  build:
-    name: Build and test (Java ${{ matrix.java-version }})
+  eks-health:
+    name: Check EKS cluster
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        java-version: [17, 21]
+
+    env:
+      AWS_REGION: ${{ github.event.inputs.region || secrets.AWS_REGION }}
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name || secrets.EKS_CLUSTER_NAME }}
+
     steps:
-      - name: Checkout repository
+
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK ${{ matrix.java-version }}
-        uses: actions/setup-java@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
         with:
-          distribution: temurin
-          java-version: ${{ matrix.java-version }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Cache Maven and Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.m2/repository
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-build-${{ matrix.java-version }}-${{ hashFiles('**/pom.xml', '**/build.gradle*') }}
-          restore-keys: |
-            ${{ runner.os }}-build-${{ matrix.java-version }}-
-
-      - name: Build and run tests (Maven or Gradle)
+      - name: Verify AWS identity
         run: |
-          set -e
-          if [ -f pom.xml ]; then
-            echo "Detected Maven build (pom.xml). Running mvn -B -T 1C verify"
-            mvn -B -T 1C -DskipTests=false verify
-          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
-            echo "Detected Gradle build (build.gradle). Running ./gradlew build"
-            if [ -f gradlew ]; then
-              chmod +x gradlew
-              ./gradlew --no-daemon build
-            else
-              gradle build
-            fi
-          else
-            echo "No pom.xml or build.gradle* found — skipping build."
+          aws sts get-caller-identity
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Update kubeconfig for EKS
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CLUSTER_NAME}" ]; then
+            echo "ERROR: CLUSTER_NAME is empty."
+            echo "Set workflow input or secret EKS_CLUSTER_NAME."
+            exit 1
           fi
 
-      - name: Upload test results
+          if [ -z "${AWS_REGION}" ]; then
+            echo "ERROR: AWS_REGION is empty."
+            echo "Set workflow input or secret AWS_REGION."
+            exit 1
+          fi
+
+          echo "Updating kubeconfig..."
+          aws eks update-kubeconfig \
+            --name "${CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Collect cluster information
+        id: collect
+        run: |
+          set -euo pipefail
+
+          mkdir -p diag
+
+          echo "=== EKS Cluster ===" > diag/eks-describe.txt
+          aws eks describe-cluster \
+            --name "${CLUSTER_NAME}" \
+            --region "${AWS_REGION}" \
+            --output yaml >> diag/eks-describe.txt
+
+          echo "=== kubectl version ===" > diag/cluster-info.txt
+          kubectl version >> diag/cluster-info.txt || true
+
+          echo "=== cluster-info ===" >> diag/cluster-info.txt
+          kubectl cluster-info >> diag/cluster-info.txt || true
+
+          echo "=== nodes ===" > diag/nodes.txt
+          kubectl get nodes -o wide >> diag/nodes.txt || true
+
+          kubectl get nodes -o json > diag/nodes.json
+          kubectl get pods --all-namespaces -o json > diag/pods.json
+
+          nodes_total=$(jq '.items | length' diag/nodes.json)
+
+          nodes_ready=$(jq '
+            [
+              .items[]
+              | select(
+                  any(
+                    .status.conditions[];
+                    .type == "Ready" and .status == "True"
+                  )
+                )
+            ] | length
+          ' diag/nodes.json)
+
+          non_ok_pods=$(jq '
+            [
+              .items[]
+              | select(
+                  .status.phase != "Running"
+                  and .status.phase != "Succeeded"
+                )
+            ] | length
+          ' diag/pods.json)
+
+          echo "nodes_total=${nodes_total}" >> "$GITHUB_OUTPUT"
+          echo "nodes_ready=${nodes_ready}" >> "$GITHUB_OUTPUT"
+          echo "non_ok_pods=${non_ok_pods}" >> "$GITHUB_OUTPUT"
+
+          echo "Nodes: ${nodes_ready}/${nodes_total} Ready"
+          echo "Non-OK pods: ${non_ok_pods}"
+
+      - name: Fail on unhealthy nodes or pods
+        run: |
+          set -euo pipefail
+
+          nodes_total="${{ steps.collect.outputs.nodes_total }}"
+          nodes_ready="${{ steps.collect.outputs.nodes_ready }}"
+          non_ok_pods="${{ steps.collect.outputs.non_ok_pods }}"
+
+          echo "Nodes: ${nodes_ready}/${nodes_total} Ready"
+          echo "Non-OK pods: ${non_ok_pods}"
+
+          if [ "${nodes_total}" -eq 0 ]; then
+            echo "ERROR: No Kubernetes nodes found."
+            exit 1
+          fi
+
+          if [ "${nodes_ready}" -lt "${nodes_total}" ]; then
+            echo "ERROR: Some nodes are not Ready."
+            kubectl get nodes -o wide
+            exit 1
+          fi
+
+          if [ "${non_ok_pods}" -gt 0 ]; then
+            echo "ERROR: Some pods are not Running or Succeeded."
+
+            kubectl get pods \
+              --all-namespaces \
+              -o wide
+
+            exit 1
+          fi
+
+          echo "Cluster looks healthy."
+          echo "All nodes are Ready and all pods are Running/Succeeded."
+
+      - name: Collect detailed diagnostics
+        if: always()
+        run: |
+          mkdir -p diag
+
+          kubectl get all \
+            --all-namespaces \
+            -o wide > diag/all-resources.txt || true
+
+          kubectl get events \
+            --all-namespaces \
+            --sort-by='.lastTimestamp' > diag/events.txt || true
+
+          tar -czf diag.tar.gz diag || true
+
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.java-version }}
-          path: |
-            **/target/surefire-reports/*.xml
-            **/build/test-results/**/*.xml
+          name: eks-diagnostics-${{ env.CLUSTER_NAME }}-${{ github.run_id }}
+          path: diag.tar.gz
