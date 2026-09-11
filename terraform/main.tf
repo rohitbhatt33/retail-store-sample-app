@@ -39,7 +39,7 @@ module "vpc" {
   # Apply Kubernetes-specific tags to subnets
   public_subnet_tags  = merge(local.common_tags, local.public_subnet_tags)
   private_subnet_tags = merge(local.common_tags, local.private_subnet_tags)
-
+  
   tags = local.common_tags
 }
 
@@ -58,7 +58,7 @@ module "retail_app_eks" {
   # Cluster access configuration
   cluster_endpoint_public_access           = true
   cluster_endpoint_private_access          = true
-  enable_cluster_creator_admin_permissions = true
+  enable_cluster_creator_admin_permissions = false
 
   # EKS Auto Mode configuration - simplified node management
   cluster_compute_config = {
@@ -74,9 +74,10 @@ module "retail_app_eks" {
   create_kms_key = true
   kms_key_description = "EKS cluster ${local.cluster_name} encryption key"
   kms_key_deletion_window_in_days = 7
-  
+
+  create_cluster_primary_security_group_tags = false
   # Cluster logging (optional - can be expensive)
   cluster_enabled_log_types = []
-
+  
   tags = local.common_tags
 }

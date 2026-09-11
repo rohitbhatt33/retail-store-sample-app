@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and test (Java ${{ matrix.java-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: [17, 21]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+
+      - name: Cache Maven and Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-build-${{ matrix.java-version }}-${{ hashFiles('**/pom.xml', '**/build.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ matrix.java-version }}-
+
+      - name: Build and run tests (Maven or Gradle)
+        run: |
+          set -e
+          if [ -f pom.xml ]; then
+            echo "Detected Maven build (pom.xml). Running mvn -B -T 1C verify"
+            mvn -B -T 1C -DskipTests=false verify
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "Detected Gradle build (build.gradle). Running ./gradlew build"
+            if [ -f gradlew ]; then
+              chmod +x gradlew
+              ./gradlew --no-daemon build
+            else
+              gradle build
+            fi
+          else
+            echo "No pom.xml or build.gradle* found — skipping build."
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.java-version }}
+          path: |
+            **/target/surefire-reports/*.xml
+            **/build/test-results/**/*.xml
