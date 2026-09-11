@@ -370,7 +370,7 @@ Error: Failed to pull image "123456789012.dkr.ecr.us-west-2.amazonaws.com/retail
 1. Ensure changes are in `src/` directory
 2. Verify you're on the `production` branch (gitops)
 3. Check GitHub Actions is enabled in repository settings
-4. Review [BRANCHING_STRATEGY.md](./BRANCHING_STRATEGY.md) for detailed setup
+4. Review [BRANCHING_STRATEGY.md](./BRANCHING_STRATEGY.md) for the detailed setup
 
 ### Getting Help
 
